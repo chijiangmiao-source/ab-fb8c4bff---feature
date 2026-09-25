@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>低温探测器标定谱系</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>低温探测器标定谱系</h1>
+  <p class="sub">原始读数 · 推导标定 · 级联失效裁决（编号与失效状态经真实接口持久化）</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>建立标定记录</h2>
+    <form id="create-form">
+      <div class="row">
+        <label>类型
+          <select id="kind" name="kind">
+            <option value="raw">原始记录（传感器原始读数）</option>
+            <option value="derived">推导记录（依赖一个或多个前序记录）</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <label>读数 / 结论内容
+          <input id="value" type="text" placeholder="例如 detector-A @ 77K = 12.4 mV" required>
+        </label>
+      </div>
+      <div class="row" id="parents-row" hidden>
+        <fieldset>
+          <legend>直接依据（仅当前有效的记录，可多选）</legend>
+          <div id="parents" class="parents"></div>
+        </fieldset>
+      </div>
+      <button type="submit">提交记录</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>失效裁决</h2>
+    <form id="invalidate-form" class="inline-form">
+      <label>目标记录编号
+        <input id="inv-target" type="text" placeholder="R000001" required>
+      </label>
+      <label>操作标识（幂等键）
+        <input id="inv-op" type="text" placeholder="例如 op-20260925-001" required>
+      </label>
+      <button type="submit" class="danger">发起失效裁决</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>记录谱系 <button id="refresh" type="button" class="linklike">刷新</button></h2>
+    <div id="records" class="records"></div>
+  </section>
+
+  <section class="card">
+    <h2>最近一次操作结果</h2>
+    <pre id="feedback" class="feedback muted">尚无操作</pre>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

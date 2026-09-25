@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# 一次性验收服务 verify（宿主机原生运行）。
+# 复现级联失效与并发竞争不变量，完成代码测试、构建检查、API/HTTP 冒烟后退出，
+# 以退出码报告结果（0=通过，1=失败）。
+#
+# 容器中等价物： docker compose --profile verify run --rm verify
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+if [[ -x ".venv/bin/python" ]]; then
+  PY=".venv/bin/python"
+else
+  PY="python3"
+fi
+
+exec "$PY" scripts/verify.py "$@"

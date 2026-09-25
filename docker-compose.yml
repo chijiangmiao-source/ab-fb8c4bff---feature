@@ -1,0 +1,43 @@
+services:
+  web:
+    build: .
+    image: cryo-calibration:latest
+    environment:
+      # 容器内监听端口；宿主映射由 HOST_PORT / WEB_PORT 控制
+      CALIBRATION_PORT: "8080"
+      CALIBRATION_DB: /data/calibration.db
+    ports:
+      # 宿主机端口可配置：HOST_PORT（默认 8080）-> 容器 8080
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      - calibration-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3))['status']=='ok'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # 一次性验收服务：复现级联失效与并发竞争不变量，
+  # 完成代码测试、构建检查、API/HTTP 冒烟后退出，以退出码报告结果。
+  # 运行： docker compose --profile verify run --rm verify
+  verify:
+    profiles: ["verify"]
+    build: .
+    image: cryo-calibration:latest
+    environment:
+      CALIBRATION_DB: /data/verify-standalone.db
+      VERIFY_PORT: "18080"
+      # 同时对 compose 中的 web 服务追加真实 HTTP 冒烟
+      VERIFY_TARGET_URL: http://web:8080
+    volumes:
+      - calibration-data:/data
+    depends_on:
+      web:
+        condition: service_healthy
+    command: ["python", "scripts/verify.py"]
+
+volumes:
+  calibration-data:
