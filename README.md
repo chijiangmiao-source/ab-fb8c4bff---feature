@@ -18,6 +18,25 @@
   （所有写事务经 `BEGIN IMMEDIATE` + 进程内锁串行化，校验与写入在同一事务）。
 - **重启持久化**：谱系、失效状态和操作重放结果存于 SQLite，重启后仍可查询。
 
+## 密封转交包（外场 → 本地谱系）
+
+- 在页面选定一条**仍有效**结论即可导出**密封转交包**：包内包含该结论及其
+  **直接依据闭包**（全部祖先），记录一律按**稳定外部标识**互相引用，与本地
+  编号无关。
+- 外部标识采用 **Merkle 内容寻址**
+  （`X + sha256(类型 + 规范载荷 + 直接依据外部标识序列)`），因此两套独立谱系中
+  内容与依据相同的记录必然得到相同标识，且标识自证身份。
+- **规范载荷与摘要**：canonical JSON（键排序、紧凑分隔）；`payload_digest`
+  覆盖根与闭包全部记录，`package_id` 为包标识。
+- **接入**在**同一持久化提交**中为整包建立外部标识→本地编号映射并写入全部记录；
+  导入后返回本地编号与直接依据。
+  - 重复接入完全相同的包（同摘要）→ 返回首次映射（`replayed=true`）；
+  - 同一包标识、不同载荷（摘要）→ `409 PACKAGE_CONFLICT`，状态不变；
+  - 缺失祖先、重复外部标识、摘要不符、外部标识不符、环、包内游离记录、
+    依据在本地已失效 → 整笔**原子拒绝**并给出 `details` 定位；
+  - 接入**不改变本地既有结论**；共享的有效祖先复用首次映射，接入后的谱系
+    仍参与原有级联失效裁决。
+
 ## 接口
 
 | 方法 | 路径 | 说明 |
@@ -29,6 +48,9 @@
 | GET | `/api/records/<id>` | 单条记录 |
 | POST | `/api/records/<id>/invalidate` | 失效裁决（请求体含 `operation_id`） |
 | GET | `/api/operations/<operation_id>` | 查询裁决首次结果 |
+| POST | `/api/records/<id>/export` | 导出仍有效结论的密封转交包 |
+| POST | `/api/packages/import` | 接入转交包（裸包或 `{"package": …}`） |
+| GET | `/api/packages/<package_id>` | 查询首次接入映射 |
 
 错误响应形如：
 
@@ -37,9 +59,16 @@
            "details": {"invalid_parent_ids": ["R000001"]}}}
 ```
 
-错误码：`PARENT_NOT_FOUND` / `SELF_REFERENCE` / `CYCLE_DETECTED` /
+记录错误码：`PARENT_NOT_FOUND` / `SELF_REFERENCE` / `CYCLE_DETECTED` /
 `PARENT_INVALID` / `RECORD_NOT_FOUND` / `RECORD_ALREADY_INVALID` /
 `OPERATION_CONFLICT` / `OPERATION_ID_REQUIRED` 等。
+
+转交包错误码：`PACKAGE_MALFORMED` / `PACKAGE_MISSING_ANCESTOR` /
+`PACKAGE_DUPLICATE_EXTERNAL_ID` / `PACKAGE_CYCLE_DETECTED` /
+`PACKAGE_EXTERNAL_ID_MISMATCH` / `PACKAGE_DIGEST_MISMATCH` /
+`PACKAGE_ROOT_MISSING` / `PACKAGE_ROOT_NOT_VALID` /
+`PACKAGE_DISCONNECTED_RECORD` / `PACKAGE_CONFLICT` /
+`PACKAGE_BASIS_INVALID` / `PACKAGE_NOT_FOUND`。
 
 ## 快速开始（宿主机）
 
@@ -79,14 +108,19 @@ docker compose --profile verify run --rm verify
 ## 测试
 
 ```bash
-.venv/bin/pytest -q          # 21 个单元/接口用例
-./verify                     # 一次性验收（含跨进程并发与重启）
+.venv/bin/pytest -q          # 单元/接口用例（创建/查询/失效 + 转交包导出/接入）
+./verify                     # 一次性验收（含跨进程并发、双谱系交接与重启）
 ```
 
 ## 关键实现位置
 
+- `app/packages.py`：规范载荷、Merkle 稳定外部标识、包摘要与全部纯函数校验
+  （缺失祖先 / 重复标识 / 环 / 标识不符 / 摘要不符 / 游离记录）。
 - `app/store.py`：单事务级联失效（递归 CTE 求下游闭包）、操作标识幂等/冲突、
-  四类引用校验、`BEGIN IMMEDIATE` 串行化、完整性自检。
+  四类引用校验、`BEGIN IMMEDIATE` 串行化、完整性自检；密封转交包的导出闭包、
+  单事务接入（外部标识映射 + 全部记录）、同包幂等与同标识冲突。
+- `app/errors.py`：可定位错误体（供 store 与 packages 共用，避免循环导入）。
 - `app/server.py`：页面、健康端点与 JSON API、统一可定位错误体。
-- `scripts/verify.py` / `verify`：一次性验收服务。
-- `tests/`：存储层与 HTTP 接口用例（含 60+ 线程并发竞争与重启持久化）。
+- `scripts/verify.py` / `verify`：一次性验收服务，含两套独立谱系导出 → 接入 →
+  重复接入 → 篡改包提交，以及 4 worker 跨进程并发交接。
+- `tests/`：存储层与 HTTP 接口用例（含转交包、60+ 线程并发竞争与重启持久化）。

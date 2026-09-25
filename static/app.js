@@ -64,6 +64,7 @@ function renderRecords() {
           <span class="id">${esc(r.id)}</span>
           <span class="badge ${esc(r.kind)}">${r.kind === "raw" ? "原始" : "推导"}</span>
           <span class="badge ${esc(r.status)}">${r.status === "valid" ? "有效" : "已失效"}</span>
+          <button type="button" class="linklike export-btn" data-export="${esc(r.id)}">导出转交包</button>
         </div>
         <div class="meta">${esc(text)}</div>
         ${basis}
@@ -137,5 +138,81 @@ $("#invalidate-form").addEventListener("submit", async (e) => {
 
 $("#refresh").addEventListener("click", () =>
   refresh().catch((e) => feedback(e.message, "error-text")));
+
+// ---------------- 密封转交包：导出 / 接入 ---------------- #
+function renderPackageSummary(label, pkg) {
+  return `${label}\n` +
+    `包标识：${pkg.package_id}\n` +
+    `包摘要：${pkg.payload_digest}\n` +
+    `根外部标识：${pkg.root_external_id}\n` +
+    `闭包记录数：${pkg.records.length}`;
+}
+
+async function exportPackage(target) {
+  const res = await api("POST",
+    `/api/records/${encodeURIComponent(target)}/export`, {});
+  $("#export-target").value = target;
+  $("#export-box").value = JSON.stringify(res.package, null, 2);
+  feedback(
+    `${renderPackageSummary("已导出密封转交包", res.package)}\n` +
+    `本地根编号：${res.root_record_id}\n直接依据：${
+      res.root_parent_ids.length ? res.root_parent_ids.join("、") : "无（原始记录）"}`,
+    "ok-text");
+}
+
+// 记录卡片上的「导出转交包」按钮（事件委托）
+$("#records").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-export]");
+  if (!btn) return;
+  try {
+    await exportPackage(btn.getAttribute("data-export"));
+  } catch (err) {
+    feedback(`导出被拒绝（${err.code || err.status}）：${err.message}\n` +
+      (err.details ? `定位信息：${JSON.stringify(err.details, null, 2)}` : ""),
+      "error-text");
+  }
+});
+
+$("#export-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    await exportPackage($("#export-target").value.trim());
+  } catch (err) {
+    feedback(`导出被拒绝（${err.code || err.status}）：${err.message}\n` +
+      (err.details ? `定位信息：${JSON.stringify(err.details, null, 2)}` : ""),
+      "error-text");
+  }
+});
+
+$("#import-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const raw = $("#import-box").value.trim();
+  let envelope;
+  try {
+    envelope = JSON.parse(raw);
+  } catch (_err) {
+    feedback("接入被拒绝：转交包不是合法 JSON", "error-text");
+    return;
+  }
+  try {
+    const res = await api("POST", "/api/packages/import",
+      envelope.format ? envelope : { package: envelope });
+    const root = res.root_record || {};
+    feedback(
+      `${res.replayed ? "重复接入：返回首次映射" : "接入完成"}\n` +
+      `包标识：${res.package_id}\n包摘要：${res.payload_digest}\n` +
+      `导入本地根编号：${res.root_record_id}\n直接依据：${
+        (root.parent_ids || []).length
+          ? root.parent_ids.join("、") : "无（原始记录）"}\n` +
+      `新写入 ${res.imported_count ?? res.record_count} 条，` +
+      `复用既有映射 ${res.reused_count ?? 0} 条`,
+      "ok-text");
+    await refresh();
+  } catch (err) {
+    feedback(`接入被原子拒绝（${err.code || err.status}）：${err.message}\n` +
+      (err.details ? `定位信息：${JSON.stringify(err.details, null, 2)}` : ""),
+      "error-text");
+  }
+});
 
 refresh().catch((e) => feedback(e.message, "error-text"));

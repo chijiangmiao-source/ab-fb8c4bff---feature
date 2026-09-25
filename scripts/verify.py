@@ -9,6 +9,9 @@
   3. API/HTTP 冒烟：拉起真实 gunicorn 服务（4 worker，跨进程竞争），
      经 HTTP 复现稳定编号、级联失效、操作重放、同标识换目标冲突、
      可定位错误反馈、并发竞争不变量，以及重启后谱系/失效状态/操作重放；
+  3b. 密封转交包：对两套独立谱系依次执行导出、接入、重复接入及篡改包
+     提交，观察映射稳定、原子拒绝、同标识冲突、失效依据拒绝、既有级联
+     失效与跨进程并发交接不变量；
   4. 可选：若设置 VERIFY_TARGET_URL，则对已运行的服务（如 compose 中的
      web 服务）追加一次真实 HTTP 冒烟。
 
@@ -172,6 +175,21 @@ def run_self_hosted_phase(rep: Report, workdir: Path) -> None:
     finally:
         server2.stop()
 
+    print("\n=== 阶段 4b：密封转交包 —— 两套独立谱系交接 ===")
+    port_a = port
+    port_b = port + 1
+    srv_a = Server(str(workdir / "lineage-a.db"), port_a, workers=2)
+    srv_b = Server(str(workdir / "lineage-b.db"), port_b, workers=2)
+    srv_a.start()
+    srv_b.start()
+    try:
+        _http_package_handover(rep, workdir,
+                               f"http://127.0.0.1:{port_a}",
+                               f"http://127.0.0.1:{port_b}")
+    finally:
+        srv_a.stop()
+        srv_b.stop()
+
 
 def _http_lifecycle(rep: Report, base: str) -> None:
     a = _post(base, "/api/records",
@@ -310,6 +328,177 @@ def _http_restart_persistence(rep: Report, base: str) -> None:
 
     opq = requests.get(f"{base}/api/operations/verify-op-cascade").json()
     rep.check("操作结果可按标识查询", opq["result"] == "completed")
+
+
+# --------------------------------------------------------------------------- #
+# 阶段 4b：密封转交包，两套独立谱系交接
+# --------------------------------------------------------------------------- #
+def _http_package_handover(rep: Report, workdir: Path,
+                           base_a: str, base_b: str) -> None:
+    import copy
+
+    # 外场谱系 A：原始 -> 多层推导，形成仍有效的结论
+    a1 = _post(base_a, "/api/records",
+               {"kind": "raw",
+                "payload": {"value": "77K/ch-A", "unit": "mV"}}).json()
+    a2 = _post(base_a, "/api/records",
+               {"kind": "raw", "payload": {"value": "4K/ch-B"}}).json()
+    a3 = _post(base_a, "/api/records", {
+        "kind": "derived", "payload": {"value": "gain"},
+        "parent_ids": [a1["id"], a2["id"]]}).json()
+    a4 = _post(base_a, "/api/records", {
+        "kind": "derived", "payload": {"value": "final-calibration"},
+        "parent_ids": [a3["id"]]}).json()
+
+    # ---- 导出：仍有效结论及其直接依据闭包 ---- #
+    exported = _post(base_a, f"/api/records/{a4['id']}/export", {}).json()
+    env = exported["package"]
+    rep.check("导出包含包标识与规范摘要",
+              env["package_id"].startswith("PKG-")
+              and env["payload_digest"].startswith("sha256:")
+              and exported["record_count"] == 4
+              and exported["root_parent_ids"] == [a3["id"]],
+              f"package_id={env['package_id']}")
+
+    # B 谱系先有一条本地既有结论
+    pre = _post(base_b, "/api/records",
+                {"kind": "raw", "payload": {"value": "b-existing"}}).json()
+    assert pre["id"] == "R000001"
+
+    # ---- 接入：同一提交建立映射并写入全部记录 ---- #
+    imp = _post(base_b, "/api/packages/import", env)
+    body = imp.json()
+    rep.check("首次接入 201，导入后根有本地编号且直接依据为本地编号",
+              imp.status_code == 201
+              and body["root_record_id"] == "R000005"
+              and body["record_count"] == 4
+              and requests.get(
+                  f"{base_b}/api/records/{body['root_record_id']}"
+              ).json()["parent_ids"] == ["R000004"])
+    first_root = body["root_record_id"]
+    rep.check("接入不改变本地既有结论",
+              requests.get(f"{base_b}/api/records/R000001").json()
+              ["payload"] == {"value": "b-existing"})
+
+    # ---- 重复接入完全相同的包：返回首次映射 ---- #
+    again = _post(base_b, "/api/packages/import", copy.deepcopy(env)).json()
+    rep.check("重复接入返回首次映射（replayed，映射稳定）",
+              again.get("replayed") is True
+              and again["root_record_id"] == first_root
+              and len(requests.get(f"{base_b}/api/records").json()) == 5)
+    pq = requests.get(f"{base_b}/api/packages/{env['package_id']}").json()
+    rep.check("包映射可按包标识查询", pq["root_record_id"] == first_root)
+
+    # ---- 同包标识、不同载荷：冲突，状态不变 ---- #
+    other = _post(base_a, f"/api/records/{a2['id']}/export", {}).json()["package"]
+    other["package_id"] = env["package_id"]
+    conflict = _post(base_b, "/api/packages/import", other)
+    rep.check("同一包标识载荷不同 -> 409 PACKAGE_CONFLICT 且无新写入",
+              conflict.status_code == 409
+              and conflict.json()["error"]["code"] == "PACKAGE_CONFLICT"
+              and len(requests.get(f"{base_b}/api/records").json()) == 5)
+
+    # ---- 篡改包提交：摘要不符 / 删祖先 / 改载荷，逐一原子拒绝 ---- #
+    tamper = copy.deepcopy(env)
+    tamper["payload_digest"] = "sha256:" + "0" * 64
+    r = _post(base_b, "/api/packages/import", tamper)
+    rep.check("篡改摘要被定位拒绝（PACKAGE_DIGEST_MISMATCH）",
+              r.status_code == 422
+              and r.json()["error"]["code"] == "PACKAGE_DIGEST_MISMATCH")
+
+    tamper2 = copy.deepcopy(env)
+    tamper2["records"][-1]["payload"] = {"value": "HACKED"}
+    r = _post(base_b, "/api/packages/import", tamper2)
+    rep.check("篡改载荷被 Merkle 外部标识校验拒绝",
+              r.json()["error"]["code"] == "PACKAGE_EXTERNAL_ID_MISMATCH")
+
+    ancestor = next(x["external_id"] for x in env["records"]
+                    if not x["parent_external_ids"]
+                    and x["external_id"] != env["root_external_id"])
+    thinned = copy.deepcopy(env)
+    thinned["records"] = [x for x in thinned["records"]
+                          if x["external_id"] != ancestor]
+    r = _post(base_b, "/api/packages/import", thinned)
+    rep.check("缺失祖先被定位拒绝（PACKAGE_MISSING_ANCESTOR）",
+              r.status_code == 422
+              and r.json()["error"]["code"] == "PACKAGE_MISSING_ANCESTOR"
+              and ancestor in
+              r.json()["error"]["details"]["missing_external_ids"])
+    rep.check("全部篡改提交后记录数仍为 5（原子拒绝）",
+              len(requests.get(f"{base_b}/api/records").json()) == 5)
+
+    # ---- 已失效依据：B 中失效导入的共享祖先后，级联与拒绝 ---- #
+    raw_pkg = _post(base_a, f"/api/records/{a1['id']}/export", {}).json()["package"]
+    # 不假设拓扑落库顺序：从首次接入映射按外部标识查出 a1 的本地编号
+    a1_local = next(m["record_id"] for m in body["mapping"]
+                    if m["external_id"] == raw_pkg["root_external_id"])
+    inv = _post(base_b, f"/api/records/{a1_local}/invalidate",
+                {"operation_id": "verify-pkg-invalid-basis"})
+    inv_ids = {c["id"] for c in inv.json()["cascade"]}
+    rep.check("既有级联失效正确：失效共享祖先后导入的根结论一并失效",
+              first_root in inv_ids and "R000004" in inv_ids
+              and requests.get(
+                  f"{base_b}/api/records/{first_root}").json()["status"]
+              == "invalid")
+    # 此后再次接入根已落在失效依据上的包：定位拒绝
+    r = _post(base_b, "/api/packages/import", copy.deepcopy(raw_pkg))
+    rep.check("已失效依据的接入被定位拒绝（PACKAGE_BASIS_INVALID）",
+              r.status_code == 422
+              and r.json()["error"]["code"] == "PACKAGE_BASIS_INVALID")
+
+    # 有效记录不得依赖失效依据（跨进程自检由记录关系推导）
+    records = requests.get(f"{base_b}/api/records").json()
+    by_id = {x["id"]: x for x in records}
+    bad = [x["id"] for x in records
+           if x["status"] == "valid"
+           and any(by_id.get(p, {}).get("status") == "invalid"
+                   for p in x["parent_ids"])]
+    rep.check("交接与失效后不存在有效记录指向失效依据", not bad,
+              f"违规：{bad}" if bad else "")
+
+    # ---- 跨进程并发：4 worker 下并发接入同一包，以及接入与失效竞争 ---- #
+    port_c = int(base_b.rsplit(":", 1)[1]) + 1
+    srv_c = Server(str(workdir / "lineage-conc.db"), port_c, workers=4)
+    srv_c.start()
+    base_c = f"http://127.0.0.1:{port_c}"
+    try:
+        # 先接入一次，建立共享依据的本地映射
+        first = _post(base_c, "/api/packages/import", env).json()
+        basis_local = next(
+            m["record_id"] for m in first["mapping"]
+            if m["external_id"] == raw_pkg["root_external_id"])
+        errors: list[str] = []
+
+        def one(i: int) -> None:
+            s = requests.Session()
+            try:
+                if i % 2 == 0:
+                    s.post(f"{base_c}/api/records/{basis_local}/invalidate",
+                           json={"operation_id": f"verify-conc-inv-{i}"},
+                           timeout=15)
+                else:
+                    s.post(f"{base_c}/api/packages/import",
+                          json=copy.deepcopy(env), timeout=15)
+            except requests.RequestException as exc:
+                errors.append(str(exc))
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(one, range(48)))
+        rep.check("并发交接期间无传输层错误", not errors, str(errors))
+
+        recs_c = requests.get(f"{base_c}/api/records").json()
+        cmap = {x["id"]: x for x in recs_c}
+        orphan = [x["id"] for x in recs_c
+                  if x["status"] == "valid"
+                  and any(cmap.get(p, {}).get("status") in (None, "invalid")
+                          for p in x["parent_ids"])]
+        rep.check("并发接入后不得出现有效记录指向不存在或失效依据",
+                  not orphan, f"违规：{orphan}" if orphan else "")
+        # 同包并发接入只产生首次映射的那一份闭包（4 条记录）
+        rep.check("并发同包接入映射唯一（只落一份闭包）",
+                  len(recs_c) == 4, f"实际记录数 {len(recs_c)}")
+    finally:
+        srv_c.stop()
 
 
 # --------------------------------------------------------------------------- #

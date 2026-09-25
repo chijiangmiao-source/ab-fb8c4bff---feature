@@ -53,6 +53,27 @@
   </section>
 
   <section class="card">
+    <h2>密封转交包</h2>
+    <form id="export-form" class="inline-form">
+      <label>导出：仍有效结论的本地编号
+        <input id="export-target" type="text" placeholder="R000003" required>
+      </label>
+      <button type="submit">导出密封转交包</button>
+    </form>
+    <label class="pkg-label">转交包（可整段复制到另一实例接入）
+      <textarea id="export-box" class="pkg-box" readonly
+        placeholder="导出后此处显示密封转交包（含包标识与摘要）"></textarea>
+    </label>
+    <form id="import-form" class="inline-form">
+      <label class="pkg-label">接入：粘贴来自另一实例的转交包
+        <textarea id="import-box" class="pkg-box" required
+          placeholder='{"format": "calibration-package/v1", ...}'></textarea>
+      </label>
+      <button type="submit">接入转交包</button>
+    </form>
+  </section>
+
+  <section class="card">
     <h2>记录谱系 <button id="refresh" type="button" class="linklike">刷新</button></h2>
     <div id="records" class="records"></div>
   </section>

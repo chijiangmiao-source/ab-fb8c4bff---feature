@@ -101,6 +101,29 @@ def create_app(db_path: str | None = None) -> Flask:
                              details={"operation_id": operation_id})
         return jsonify(result)
 
+    # ---------------- 密封转交包：导出 / 接入 / 查询 ---------------- #
+    @app.post("/api/records/<record_id>/export")
+    def export_package(record_id: str):
+        # 导出是只读操作，但要求结论仍有效（失效结论不可密封转交）
+        result = store.export_package(record_id)
+        return jsonify(result), 200
+
+    @app.post("/api/packages/import")
+    def import_package():
+        # 请求体可以是裸包，也可以是 {"package": {...}}
+        data = parse_json()
+        envelope = data.get("package") if "package" in data else data
+        if not isinstance(envelope, dict):
+            raise StoreError("INVALID_BODY",
+                             "请求体必须是转交包对象或 {\"package\": 包对象}",
+                             status=400)
+        result = store.import_package(envelope)
+        return jsonify(result), 200 if result.get("replayed") else 201
+
+    @app.get("/api/packages/<package_id>")
+    def get_package(package_id: str):
+        return jsonify(store.get_package(package_id))
+
     # ---------------- 错误处理 ---------------- #
     @app.errorhandler(StoreError)
     def handle_store_error(err: StoreError):
