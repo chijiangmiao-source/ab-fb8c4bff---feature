@@ -20,7 +20,27 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # 一次性验收服务：复现级联失效与并发竞争不变量，
+  # 第二套独立谱系（本地谱系）：独立数据库卷，用于验证跨实例密封转交
+  web-b:
+    build: .
+    image: cryo-calibration:latest
+    environment:
+      CALIBRATION_PORT: "8080"
+      CALIBRATION_DB: /data-b/calibration.db
+    ports:
+      - "${HOST_PORT_B:-8081}:8080"
+    volumes:
+      - calibration-data-b:/data-b
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3))['status']=='ok'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # 一次性验收服务：复现级联失效、并发竞争与密封转交不变量，
   # 完成代码测试、构建检查、API/HTTP 冒烟后退出，以退出码报告结果。
   # 运行： docker compose --profile verify run --rm verify
   verify:
@@ -30,14 +50,19 @@ services:
     environment:
       CALIBRATION_DB: /data/verify-standalone.db
       VERIFY_PORT: "18080"
-      # 同时对 compose 中的 web 服务追加真实 HTTP 冒烟
+      # 对 compose 中的两套独立服务追加真实 HTTP 冒烟（外场 web -> 本地 web-b）
       VERIFY_TARGET_URL: http://web:8080
+      HANDOFF_TARGET_URL: http://web-b:8080
     volumes:
       - calibration-data:/data
+      - calibration-data-b:/data-b
     depends_on:
       web:
+        condition: service_healthy
+      web-b:
         condition: service_healthy
     command: ["python", "scripts/verify.py"]
 
 volumes:
   calibration-data:
+  calibration-data-b:

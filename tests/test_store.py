@@ -206,6 +206,32 @@ def test_concurrent_duplicate_invalidation_single_winner(store):
     store.assert_invariants()
 
 
+def test_legacy_db_without_ext_id_is_migrated(tmp_path):
+    """旧版数据库（records 无 ext_id 列）打开时自动补齐并回填外部标识。"""
+    import sqlite3
+    db = str(tmp_path / "legacy.db")
+    con = sqlite3.connect(db)
+    con.executescript("""
+    CREATE TABLE records (id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+      payload TEXT NOT NULL, status TEXT NOT NULL,
+      invalidated_by TEXT, invalidated_at TEXT, created_at TEXT NOT NULL);
+    INSERT INTO records VALUES ('R000001','raw','{}','valid',NULL,NULL,'t');
+    """)
+    con.commit()
+    con.close()
+
+    s = CalibrationStore(db)
+    rec = s.get_record("R000001")
+    assert rec["ext_id"] and len(rec["ext_id"]) == 32
+    pack = s.export_package("R000001")
+    assert pack["root_ext_id"] == rec["ext_id"]
+    s.close()
+
+    s2 = CalibrationStore(db)  # 重开不重复迁移
+    assert s2.get_record("R000001")["ext_id"] == rec["ext_id"]
+    s2.close()
+
+
 def test_persistence_after_reopen(tmp_path):
     db = str(tmp_path / "persist.db")
     s1 = CalibrationStore(db)

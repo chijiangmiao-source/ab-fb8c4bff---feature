@@ -53,6 +53,27 @@
   </section>
 
   <section class="card">
+    <h2>密封转交包（外场 → 本地谱系）</h2>
+    <div class="handoff">
+      <div class="sub-block">
+        <h3>导出（选定仍有效的结论）</h3>
+        <p class="muted small">在下方谱系中点击某条<strong>有效</strong>记录的「导出密封包」，
+          将按其直接依据闭包生成带摘要的密封包。</p>
+        <div id="export-summary" class="muted small">尚未导出</div>
+        <textarea id="export-package" class="package" rows="8" readonly
+          placeholder="导出的密封转交包 JSON 将显示在此，可整体复制"></textarea>
+      </div>
+      <div class="sub-block">
+        <h3>接入（粘贴另一实例的包）</h3>
+        <textarea id="import-package" class="package" rows="8"
+          placeholder="在此粘贴密封转交包 JSON"></textarea>
+        <button id="import-btn" type="button" class="handoff-btn">接入转交包</button>
+        <div id="import-summary" class="muted small">尚未接入</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
     <h2>记录谱系 <button id="refresh" type="button" class="linklike">刷新</button></h2>
     <div id="records" class="records"></div>
   </section>

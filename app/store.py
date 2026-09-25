@@ -5,8 +5,12 @@
 1. 一条失效裁决使目标记录及全部可达下游记录在同一持久化提交中失效；
 2. 操作标识幂等：重复裁决返回首次结果；同一操作标识改换目标 -> 冲突且不改状态；
 3. 新建推导记录时，任一前序不存在 / 已失效 / 自引用 / 成环 -> 整笔拒绝，既有结论不变；
-4. 写事务串行化（BEGIN IMMEDIATE），因此“新推导”与“失效裁决”竞争后，
-   不可能存在有效记录依赖失效记录。
+4. 写事务串行化（BEGIN IMMEDIATE），因此“新推导”“失效裁决”“转交接入”竞争后，
+   不可能存在有效记录依赖失效记录；
+5. 转交包接入：结构/摘要/图校验全部通过后，在同一提交内建立外部标识映射并
+   写入全部记录；同包重复接入返回首次映射；同包标识不同载荷冲突；本地既有结论不变。
+
+每条记录出生即带稳定外部标识 ext_id（跨实例），本地编号 id（R000001…）仅本实例有效。
 """
 
 from __future__ import annotations
@@ -17,6 +21,9 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
+from . import package as pkg
+from .errors import StoreError
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -24,6 +31,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 CREATE TABLE IF NOT EXISTS records (
     id              TEXT PRIMARY KEY,
+    ext_id          TEXT NOT NULL UNIQUE,
     kind            TEXT NOT NULL CHECK (kind IN ('raw', 'derived')),
     payload         TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('valid', 'invalid')),
@@ -45,27 +53,47 @@ CREATE TABLE IF NOT EXISTS operations (
     response_json    TEXT NOT NULL,
     created_at       TEXT NOT NULL
 );
+-- 外部标识 -> 本地编号映射：整包接入时在同一提交内建立
+CREATE TABLE IF NOT EXISTS ext_mapping (
+    ext_id     TEXT PRIMARY KEY,
+    record_id  TEXT NOT NULL UNIQUE REFERENCES records(id),
+    package_id TEXT,
+    created_at TEXT NOT NULL
+);
+-- 已接入转交包登记：包标识 -> 首次摘要 / 首次映射结果
+CREATE TABLE IF NOT EXISTS imports (
+    package_id      TEXT PRIMARY KEY,
+    digest          TEXT NOT NULL,
+    root_ext_id     TEXT NOT NULL,
+    root_record_id  TEXT NOT NULL,
+    response_json   TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
-
-
-class StoreError(Exception):
-    """业务校验错误，携带可定位信息。"""
-
-    def __init__(self, code: str, message: str, status: int = 422,
-                 details: dict[str, Any] | None = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.status = status
-        self.details = details or {}
-
-    def to_response(self) -> tuple[dict[str, Any], int]:
-        return {"error": {"code": self.code, "message": self.message,
-                          "details": self.details}}, self.status
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def _topo_order(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """父在前的稳定拓扑序（调用前已保证无环、无缺失祖先）。"""
+    by_ext = {r["ext_id"]: r for r in records}
+    ordered: list[dict[str, Any]] = []
+    placed: set[str] = set()
+
+    def visit(ext: str) -> None:
+        if ext in placed:
+            return
+        for p in by_ext[ext]["parent_ext_ids"]:
+            if p in by_ext:
+                visit(p)
+        placed.add(ext)
+        ordered.append(by_ext[ext])
+
+    for r in records:
+        visit(r["ext_id"])
+    return ordered
 
 
 class CalibrationStore:
@@ -85,6 +113,23 @@ class CalibrationStore:
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate_ext_id()
+
+    def _migrate_ext_id(self) -> None:
+        """旧库 records 可能没有 ext_id 列，补齐并回填稳定外部标识。"""
+        cols = {r["name"] for r in
+                self._conn.execute("PRAGMA table_info(records)")}
+        if "ext_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE records ADD COLUMN ext_id TEXT")
+            rows = self._conn.execute("SELECT id FROM records").fetchall()
+            for r in rows:
+                self._conn.execute(
+                    "UPDATE records SET ext_id=? WHERE id=?",
+                    (pkg.new_ext_id(), r["id"]))
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_ext "
+                "ON records(ext_id)")
 
     def close(self) -> None:
         with self._lock:
@@ -128,10 +173,18 @@ class CalibrationStore:
             return None
         return json.loads(row["response_json"])
 
+    def get_import(self, package_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT response_json FROM imports WHERE package_id=?",
+                (package_id,)).fetchone()
+        return json.loads(row["response_json"]) if row else None
+
     @staticmethod
     def _row_to_dict(row: sqlite3.Row, parents: list[str]) -> dict[str, Any]:
         return {
             "id": row["id"],
+            "ext_id": row["ext_id"],
             "kind": row["kind"],
             "payload": json.loads(row["payload"]),
             "status": row["status"],
@@ -141,12 +194,17 @@ class CalibrationStore:
             "created_at": row["created_at"],
         }
 
+    @staticmethod
+    def _content_signature(kind: str, payload: dict[str, Any]) -> str:
+        return f"{kind}|{json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+
     # ------------------------------------------------------------------ #
     # 创建原始 / 推导记录
     # ------------------------------------------------------------------ #
     def create_record(self, kind: str, payload: dict[str, Any],
                       parent_ids: list[str] | None,
-                      record_id: str | None = None) -> dict[str, Any]:
+                      record_id: str | None = None,
+                      ext_id: str | None = None) -> dict[str, Any]:
         if kind not in ("raw", "derived"):
             raise StoreError("INVALID_KIND", f"未知记录类型 {kind!r}",
                              status=400, details={"kind": kind})
@@ -162,6 +220,14 @@ class CalibrationStore:
                     raise StoreError("RECORD_ID_CONFLICT",
                                      f"记录编号 {rid} 已存在", status=409,
                                      details={"record_id": rid})
+
+                ext = ext_id or pkg.new_ext_id()
+                if self._conn.execute(
+                        "SELECT 1 FROM records WHERE ext_id=?",
+                        (ext,)).fetchone():
+                    raise StoreError("EXT_ID_CONFLICT",
+                                     f"外部标识 {ext} 已存在", status=409,
+                                     details={"ext_id": ext})
 
                 if kind == "raw" and parent_ids:
                     raise StoreError(
@@ -215,22 +281,28 @@ class CalibrationStore:
                         "引用关系形成环",
                         details={"record_id": rid, "parent_ids": parent_ids})
 
-                now = _utcnow()
-                self._conn.execute(
-                    "INSERT INTO records (id, kind, payload, status, "
-                    "invalidated_by, invalidated_at, created_at) "
-                    "VALUES (?, ?, ?, 'valid', NULL, NULL, ?)",
-                    (rid, kind, json.dumps(payload, ensure_ascii=False), now))
-                for seq, pid in enumerate(parent_ids):
-                    self._conn.execute(
-                        "INSERT INTO edges (child_id, parent_id, seq) "
-                        "VALUES (?, ?, ?)", (rid, pid, seq))
+                self._insert_record_locked(rid, ext, kind, payload,
+                                           parent_ids)
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
 
         return self.get_record(rid)
+
+    def _insert_record_locked(self, rid: str, ext: str, kind: str,
+                              payload: dict[str, Any],
+                              parent_ids: list[str]) -> None:
+        now = _utcnow()
+        self._conn.execute(
+            "INSERT INTO records (id, ext_id, kind, payload, status, "
+            "invalidated_by, invalidated_at, created_at) "
+            "VALUES (?, ?, ?, ?, 'valid', NULL, NULL, ?)",
+            (rid, ext, kind, json.dumps(payload, ensure_ascii=False), now))
+        for seq, pid in enumerate(parent_ids):
+            self._conn.execute(
+                "INSERT INTO edges (child_id, parent_id, seq) "
+                "VALUES (?, ?, ?)", (rid, pid, seq))
 
     def _allocate_id_locked(self) -> str:
         row = self._conn.execute(
@@ -364,11 +436,246 @@ class CalibrationStore:
             """, (target_id,)).fetchall()
         return [r["id"] for r in rows]
 
+    def _ancestor_closure_rows_locked(self, root_id: str) -> list[sqlite3.Row]:
+        """根及其全部祖先（沿 child->parent 传播）的记录行。"""
+        return self._conn.execute(
+            """
+            WITH RECURSIVE reach(id) AS (
+                SELECT ?
+                UNION
+                SELECT e.parent_id
+                FROM edges e JOIN reach r ON e.child_id = r.id
+            )
+            SELECT rec.* FROM records rec
+            JOIN reach ON reach.id = rec.id
+            ORDER BY rec.created_at, rec.id
+            """, (root_id,)).fetchall()
+
+    # ------------------------------------------------------------------ #
+    # 密封转交包：导出
+    # ------------------------------------------------------------------ #
+    def export_package(self, root_id: str) -> dict[str, Any]:
+        """选定一条仍有效的结论，导出其完整有效依据闭包密封包。"""
+        with self._lock:
+            root = self._conn.execute(
+                "SELECT id, ext_id, status FROM records WHERE id=?",
+                (root_id,)).fetchone()
+            if root is None:
+                raise StoreError("RECORD_NOT_FOUND",
+                                 f"转交结论 {root_id} 不存在", status=404,
+                                 details={"record_id": root_id})
+            if root["status"] != "valid":
+                raise StoreError(
+                    "PACKAGE_ROOT_INVALID",
+                    f"转交结论 {root_id} 已失效，只允许转交仍有效的结论",
+                    status=409, details={"record_id": root_id})
+
+            rows = self._ancestor_closure_rows_locked(root_id)
+            invalid = [r["id"] for r in rows if r["status"] != "valid"]
+            if invalid:
+                # 由既有不变量，有效根不会有失效祖先；防御性拦截并定位。
+                raise StoreError(
+                    "PACKAGE_BASIS_INVALID",
+                    f"转交闭包中存在已失效依据：{', '.join(invalid)}",
+                    status=409, details={"invalid_record_ids": invalid})
+
+            edge_rows = self._conn.execute(
+                """
+                WITH RECURSIVE reach(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT e.parent_id
+                    FROM edges e JOIN reach r ON e.child_id = r.id
+                )
+                SELECT e.child_id, e.parent_id, e.seq
+                FROM edges e JOIN reach ON reach.id = e.child_id
+                ORDER BY e.child_id, e.seq
+                """, (root_id,)).fetchall()
+
+        parents_by_child: dict[str, list[str]] = {}
+        ext_by_local: dict[str, str] = {r["id"]: r["ext_id"] for r in rows}
+        for e in edge_rows:
+            parents_by_child.setdefault(e["child_id"], []).append(e["parent_id"])
+
+        records = []
+        for r in rows:
+            records.append({
+                "ext_id": r["ext_id"],
+                "kind": r["kind"],
+                "payload": json.loads(r["payload"]),
+                "parent_ext_ids": [ext_by_local[p] for p in
+                                   parents_by_child.get(r["id"], [])],
+            })
+        envelope = pkg.build_package(root["ext_id"], records)
+        return envelope
+
+    # ------------------------------------------------------------------ #
+    # 密封转交包：接入（单事务：建映射 + 写全部记录）
+    # ------------------------------------------------------------------ #
+    def import_package(self, raw: Any) -> dict[str, Any]:
+        """接入另一实例导出的密封转交包。
+
+        - 先做与库无关的完整结构/摘要/图校验；
+        - 同一 package_id 且同摘要：返回首次映射（replayed=true）；
+        - 同一 package_id 不同摘要：409 PACKAGE_CONFLICT；
+        - 任一外部标识已映射到**已失效**本地记录：拒绝（已失效依据可定位）；
+        - 新外部标识在同一提交内分配本地编号、写映射、写全部记录与边。
+        """
+        envelope = pkg.parse_and_validate(raw)
+        package_id = envelope["package_id"]
+        digest = envelope["digest"]
+        root_ext = envelope["root_ext_id"]
+        records = envelope["records"]  # 父在前拓扑序
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._conn.execute(
+                    "SELECT digest, response_json FROM imports "
+                    "WHERE package_id=?", (package_id,)).fetchone()
+                if existing is not None:
+                    if existing["digest"] != digest:
+                        raise StoreError(
+                            "PACKAGE_CONFLICT",
+                            f"包标识 {package_id} 已接入过不同载荷"
+                            "（摘要不符），拒绝接入",
+                            status=409,
+                            details={"package_id": package_id,
+                                     "original_digest": existing["digest"],
+                                     "conflicting_digest": digest})
+                    response = json.loads(existing["response_json"])
+                    response["replayed"] = True
+                    self._conn.execute("COMMIT")
+                    return response
+
+                # 解析既有 ext_id -> 本地记录，判定复用 / 失效 / 冲突。
+                ext_records = {r["ext_id"]: r for r in records}
+                mapping: dict[str, str] = {}
+                reused: list[str] = []
+                invalid_basis: list[str] = []
+                conflicting: list[str] = []
+
+                for ext, r in ext_records.items():
+                    row = self._conn.execute(
+                        "SELECT m.record_id AS rid, rec.status AS status, "
+                        "rec.kind AS kind, rec.payload AS payload "
+                        "FROM ext_mapping m JOIN records rec "
+                        "ON rec.id = m.record_id WHERE m.ext_id=?",
+                        (ext,)).fetchone()
+                    if row is None:
+                        continue
+                    local_id = row["rid"]
+                    if row["status"] != "valid":
+                        invalid_basis.append(
+                            {"ext_id": ext, "record_id": local_id})
+                        continue
+                    # 复用共享祖先：内容必须一致
+                    sig_new = self._content_signature(
+                        r["kind"], r["payload"])
+                    sig_old = self._content_signature(
+                        row["kind"], json.loads(row["payload"]))
+                    # 且该既有记录在本地的来源依据（外部标识集合）必须与包
+                    # 内声称的直接依据一致，否则为矛盾谱系，不能复用。
+                    local_parent_exts = {
+                        pr["ext_id"] for pr in self._conn.execute(
+                            "SELECT p.ext_id AS ext_id FROM edges e "
+                            "JOIN records p ON p.id = e.parent_id "
+                            "WHERE e.child_id=?", (local_id,)).fetchall()}
+                    claimed_parent_exts = set(r["parent_ext_ids"])
+                    if sig_new != sig_old \
+                            or local_parent_exts != claimed_parent_exts:
+                        conflicting.append({
+                            "ext_id": ext, "record_id": local_id,
+                            "reason": ("content" if sig_new != sig_old
+                                       else "basis"),
+                            "local_parent_ext_ids":
+                                sorted(local_parent_exts),
+                            "claimed_parent_ext_ids":
+                                sorted(claimed_parent_exts),
+                        })
+                        continue
+                    mapping[ext] = local_id
+                    reused.append(ext)
+
+                if invalid_basis:
+                    raise StoreError(
+                        "PARENT_INVALID",
+                        "转交依据中存在本地已失效记录，不能接入",
+                        status=422,
+                        details={"invalid_basis": invalid_basis})
+                if conflicting:
+                    raise StoreError(
+                        "EXT_CONTENT_CONFLICT",
+                        "外部标识已映射到内容不同的本地记录",
+                        status=409, details={"conflicts": conflicting})
+
+                # 为新 ext_id 分配本地编号
+                now = _utcnow()
+                new_nodes = [r for r in records
+                             if r["ext_id"] not in mapping]
+                allocated: dict[str, str] = {}
+                for r in new_nodes:
+                    local_id = self._allocate_id_locked()
+                    allocated[r["ext_id"]] = local_id
+                    mapping[r["ext_id"]] = local_id
+
+                # 按父在前的拓扑序落库，保证子记录插入时其（同为新增的）
+                # 父记录已存在，满足外键即时约束。
+                ordered = _topo_order(records)
+                for r in ordered:
+                    if r["ext_id"] not in allocated:
+                        continue  # 复用的既有节点
+                    local_id = allocated[r["ext_id"]]
+                    parent_local = [mapping[p]
+                                    for p in r["parent_ext_ids"]]
+                    self._insert_record_locked(
+                        local_id, r["ext_id"], r["kind"],
+                        r["payload"], parent_local)
+                    self._conn.execute(
+                        "INSERT INTO ext_mapping (ext_id, record_id, "
+                        "package_id, created_at) VALUES (?, ?, ?, ?)",
+                        (r["ext_id"], local_id, package_id, now))
+
+                root_local = mapping[root_ext]
+                root_direct_parents = [mapping[p] for p in
+                                       ext_records[root_ext]["parent_ext_ids"]]
+                response = {
+                    "result": "imported",
+                    "replayed": False,
+                    "package_id": package_id,
+                    "digest": digest,
+                    "root_ext_id": root_ext,
+                    "root_record_id": root_local,
+                    "direct_parent_ids": root_direct_parents,
+                    "reused_ext_ids": sorted(reused),
+                    "mapping": [{"ext_id": ext, "record_id": mapping[ext]}
+                                for ext in sorted(mapping)],
+                }
+                self._conn.execute(
+                    "INSERT INTO imports (package_id, digest, root_ext_id, "
+                    "root_record_id, response_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (package_id, digest, root_ext, root_local,
+                     json.dumps(response, ensure_ascii=False), now))
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+        return self._with_live_import(response)
+
+    def _with_live_import(self, response: dict[str, Any]) -> dict[str, Any]:
+        """提交后回读，确保返回的本地编号/依据与库一致。"""
+        root = self.get_record(response["root_record_id"])
+        response["direct_parent_ids"] = root["parent_ids"]
+        response["root_status"] = root["status"]
+        return response
+
     # ------------------------------------------------------------------ #
     # 完整性自检（验收用）
     # ------------------------------------------------------------------ #
     def assert_invariants(self) -> None:
-        """有效记录不得依赖失效记录。"""
+        """有效记录不得依赖失效或不存在记录；映射必须双向一致。"""
         with self._lock:
             row = self._conn.execute(
                 """
@@ -379,7 +686,27 @@ class CalibrationStore:
                 WHERE c.status='valid' AND p.status='invalid'
                 LIMIT 1
                 """).fetchone()
-        if row is not None:
-            raise AssertionError(
-                f"不变量被破坏：有效记录 {row['child_id']} "
-                f"依赖失效记录 {row['parent_id']}")
+            if row is not None:
+                raise AssertionError(
+                    f"不变量被破坏：有效记录 {row['child_id']} "
+                    f"依赖失效记录 {row['parent_id']}")
+            orphan = self._conn.execute(
+                """
+                SELECT e.child_id, e.parent_id FROM edges e
+                LEFT JOIN records p ON p.id = e.parent_id
+                WHERE p.id IS NULL LIMIT 1
+                """).fetchone()
+            if orphan is not None:
+                raise AssertionError(
+                    f"不变量被破坏：记录 {orphan['child_id']} "
+                    f"指向不存在依据 {orphan['parent_id']}")
+            bad_map = self._conn.execute(
+                """
+                SELECT m.ext_id, m.record_id FROM ext_mapping m
+                LEFT JOIN records r ON r.id = m.record_id
+                WHERE r.id IS NULL OR r.ext_id != m.ext_id
+                LIMIT 1
+                """).fetchone()
+            if bad_map is not None:
+                raise AssertionError(
+                    f"不变量被破坏：外部标识映射失配 {dict(bad_map.keys())}")

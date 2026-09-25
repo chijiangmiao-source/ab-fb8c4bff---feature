@@ -58,15 +58,23 @@ function renderRecords() {
           r.invalidated_at ? ` · ${esc(r.invalidated_at)}` : ""
         }</div>`
       : "";
+    const ext = r.ext_id
+      ? `<div class="meta">外部标识：<span class="pid">${esc(r.ext_id)}</span></div>`
+      : "";
+    const exportBtn = r.status === "valid"
+      ? `<button type="button" class="linklike export-btn" data-id="${esc(r.id)}">导出密封包</button>`
+      : "";
     return `
       <div class="record">
         <div class="head">
           <span class="id">${esc(r.id)}</span>
           <span class="badge ${esc(r.kind)}">${r.kind === "raw" ? "原始" : "推导"}</span>
           <span class="badge ${esc(r.status)}">${r.status === "valid" ? "有效" : "已失效"}</span>
+          ${exportBtn}
         </div>
         <div class="meta">${esc(text)}</div>
         ${basis}
+        ${ext}
         ${src}
       </div>`;
   }).join("");
@@ -137,5 +145,65 @@ $("#invalidate-form").addEventListener("submit", async (e) => {
 
 $("#refresh").addEventListener("click", () =>
   refresh().catch((e) => feedback(e.message, "error-text")));
+
+// ---------------- 密封转交包：导出 / 接入 ---------------- #
+$("#records").addEventListener("click", async (e) => {
+  const btn = e.target.closest(".export-btn");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  try {
+    const pkg = await api("POST",
+      `/api/records/${encodeURIComponent(id)}/export`, {});
+    $("#export-package").value = JSON.stringify(pkg, null, 2);
+    const root = pkg.records.find((r) => r.ext_id === pkg.root_ext_id);
+    $("#export-summary").innerHTML =
+      `包标识 <span class="pid">${esc(pkg.package_id)}</span><br>` +
+      `摘要 <span class="pid">${esc(pkg.digest)}</span><br>` +
+      `转交结论外部标识 <span class="pid">${esc(pkg.root_ext_id)}</span>` +
+      `（本地 ${esc(id)}），闭包记录 ${pkg.records.length} 条，` +
+      `直接依据 ${(root?.parent_ext_ids || []).map(esc).join("、") || "无"}`;
+    feedback(`已导出密封转交包 ${pkg.package_id}（${pkg.records.length} 条记录）`,
+      "ok-text");
+  } catch (err) {
+    feedback(`导出被拒绝（${err.code || err.status}）：${err.message}`,
+      "error-text");
+  }
+});
+
+$("#import-btn").addEventListener("click", async () => {
+  const text = $("#import-package").value.trim();
+  if (!text) {
+    feedback("请先粘贴密封转交包 JSON", "error-text");
+    return;
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch (err) {
+    feedback(`接入失败：粘贴内容不是合法 JSON（${err.message}）`, "error-text");
+    return;
+  }
+  try {
+    const res = await api("POST", "/api/packages/import", body);
+    $("#import-summary").innerHTML =
+      `${res.replayed ? "重复接入，返回首次映射" : "接入成功"}<br>` +
+      `包标识 <span class="pid">${esc(res.package_id)}</span><br>` +
+      `摘要 <span class="pid">${esc(res.digest)}</span><br>` +
+      `导入后本地编号 <span class="pid">${esc(res.root_record_id)}</span>` +
+      `（有效：${res.root_status}）<br>` +
+      `直接依据 ${(res.direct_parent_ids || []).map(esc).join("、") || "无"}<br>` +
+      `写入映射 ${res.mapping.length} 条（复用既有 ${res.reused_ext_ids.length} 条）`;
+    feedback(
+      `${res.replayed ? "重复接入（幂等）" : "接入完成"}：` +
+      `根本地编号 ${res.root_record_id}，映射 ${res.mapping.length} 条`,
+      "ok-text");
+    await refresh();
+  } catch (err) {
+    feedback(`接入被拒绝（${err.code || err.status}）：${err.message}\n` +
+      (err.details ? `定位信息：${JSON.stringify(err.details, null, 2)}` : ""),
+      "error-text");
+    $("#import-summary").textContent = "接入被原子拒绝，本地既有结论未改变";
+  }
+});
 
 refresh().catch((e) => feedback(e.message, "error-text"));
